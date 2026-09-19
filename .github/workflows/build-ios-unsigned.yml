@@ -115,40 +115,73 @@ jobs:
         run: |
           cd ios
           # scheme 与应用名一致（app.json 里的 name 是 DSH）
-          # 关键：**不要**把 xcodebuild 的输出直接接 tail —— 真错误在最前面，
-          # 接 tail 只会看到一堆 "Disabling previews" 噪音，等于把病因删掉。
-          # 先全量落盘，失败时再挑错误行打印。
-          set +e
-          xcodebuild \
-            -workspace DSH.xcworkspace \
-            -scheme DSH \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            > /tmp/xcodebuild.log 2>&1
-          CODE=$?
-          set -e
-          echo "xcodebuild exit code: $CODE"
-          if [ "$CODE" -ne 0 ]; then
-            echo "======== 错误行 ========"
-            grep -nE 'error:|fatal error|BUILD FAILED|build commands failed|Undefined symbol|Command .* failed|Reason:|is not a valid|does not exist' /tmp/xcodebuild.log | head -n 120 || true
-            echo "======== 前 80 行 ========"
-            head -n 80 /tmp/xcodebuild.log
-            echo "======== 后 150 行 ========"
-            tail -n 150 /tmp/xcodebuild.log
-            exit "$CODE"
+          #
+          # 为什么要逐个试 Xcode：
+          #   - 新版 clang（Xcode 26.3）把 expo-modules-jsi 的 RuntimeScheduler.h
+          #     里构造函数的 SWIFT_RETURNS_RETAINED 判成了**错误**：
+          #     "'RuntimeScheduler' cannot be annotated with either SWIFT_RETURNS_RETAINED
+          #      or SWIFT_RETURNS_UNRETAINED because it is not returning a
+          #      SWIFT_SHARED_REFERENCE type"（类尾部才挂 SWIFT_SHARED_REFERENCE，
+          #     新 clang 提前检查 → 判不出来）。
+          #   - 但 Package.swift 又要 swift-tools-version 6.2，只有 Xcode 26.x 有。
+          #   所以只能在 26.x 里挑一个 clang 不那么激进的：26.2 → 26.1.1 → 26.0.1。
+          #   失败一次只要 ~1 分钟，比来回改配置便宜得多。
+          #
+          # 另外：**不要**把输出接 tail —— 真错误在最前面，接 tail 等于删掉病因。
+          CANDIDATES=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V -r)
+          echo "候选 Xcode（新→旧）:"; echo "$CANDIDATES"
+          ALLFAIL=1
+          for XC in $CANDIDATES; do
+            VER=$(basename "$XC" .app)
+            VER=${VER#Xcode_}
+            echo "================ 试 Xcode $VER ================"
+            sudo xcode-select -s "$XC"
+            export DEVELOPER_DIR="$XC/Contents/Developer"
+            DD="build-$VER"
+            LOG="/tmp/xcodebuild-$VER.log"
+            set +e
+            xcodebuild \
+              -workspace DSH.xcworkspace \
+              -scheme DSH \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$DD" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGN_ENTITLEMENTS="" \
+              > "$LOG" 2>&1
+            CODE=$?
+            set -e
+            echo "Xcode $VER 退出码: $CODE"
+            if [ "$CODE" -eq 0 ]; then
+              echo "== 用 Xcode $VER 编译成功 =="
+              echo "CHOSEN_XCODE=$VER" >> "$GITHUB_ENV"
+              echo "CHOSEN_DD=$DD" >> "$GITHUB_ENV"
+              tail -n 15 "$LOG"
+              ALLFAIL=0
+              break
+            fi
+            echo "---- Xcode $VER 的错误行 ----"
+            grep -nE 'error:|fatal error|BUILD FAILED|build commands failed' "$LOG" | head -n 30 || true
+            echo "---- Xcode $VER 第一条 error 的上下文（含 include 链）----"
+            FIRST=$(grep -nE 'error:' "$LOG" | head -n 1 | cut -d: -f1 || true)
+            if [ -n "$FIRST" ]; then
+              START=$(( FIRST > 30 ? FIRST - 30 : 1 ))
+              sed -n "${START},$(( FIRST + 5 ))p" "$LOG"
+            fi
+          done
+          if [ "$ALLFAIL" -ne 0 ]; then
+            echo "所有候选 Xcode 都编译失败，见上面的错误行与 include 链"
+            exit 1
           fi
-          tail -n 20 /tmp/xcodebuild.log
 
       - name: 打成一个未签名的 ipa
         run: |
           set -euo pipefail
-          APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          echo "用 Xcode $CHOSEN_XCODE 的产物（derivedData: ios/$CHOSEN_DD）"
+          APP_PATH=$(find "ios/$CHOSEN_DD/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n 1)
           echo "app: $APP_PATH"
           rm -rf Payload DSH-unsigned.ipa
           mkdir -p Payload
