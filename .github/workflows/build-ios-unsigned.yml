@@ -84,6 +84,33 @@ jobs:
           ls -1 ios
           ls -1 ios/*.xcworkspace
 
+      - name: 摘掉 aps-environment 权限（免费 Apple ID 没有推送能力，留着会签不上）
+        run: |
+          # expo-notifications 的 config plugin 会往 entitlements 里塞
+          # aps-environment=development。而我们只用**本地**通知
+          # （Notifications.scheduleNotificationAsync），本地通知不需要任何权限项。
+          # 但推送权限项在「免费 Apple ID 个人团队」下不可用，
+          # Sideloadly 签名时会因为 provisioning profile 里没有这个权限而失败。
+          # 所以这里把它删掉 —— 只删权限项，通知功能本身不受影响。
+          python3 - <<'PY'
+          import glob, plistlib
+          found = False
+          for p in glob.glob('ios/**/*.entitlements', recursive=True):
+              found = True
+              with open(p, 'rb') as f:
+                  d = plistlib.load(f)
+              if 'aps-environment' in d:
+                  del d['aps-environment']
+                  with open(p, 'wb') as f:
+                      plistlib.dump(d, f)
+                  print('stripped aps-environment:', p)
+              else:
+                  print('no aps-environment:', p)
+              print('remaining keys:', sorted(d.keys()))
+          if not found:
+              print('no .entitlements file at all (这样反而最省事)')
+          PY
+
       - name: 编译（关闭签名）
         run: |
           cd ios
