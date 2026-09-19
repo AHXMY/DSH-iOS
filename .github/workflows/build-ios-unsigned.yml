@@ -21,13 +21,29 @@ on:
 
 jobs:
   build:
-    # 用 macOS 机器是硬要求：只有它能跑 xcodebuild
-    runs-on: macos-14
+    # 用 macOS 机器是硬要求：只有它能跑 xcodebuild。
+    # macos-15 带 Xcode 16.x —— RN 0.86 / Expo SDK 57 要求 Xcode 16 以上，
+    # macos-14 默认只有 15.x，会直接在编译期报 SDK 版本不足。
+    runs-on: macos-15
     timeout-minutes: 60
+
+    env:
+      # 让 expo prebuild 跳过 git 工作区检查：/ios 是 prebuild 现场生成的，
+      # 非交互环境下那个 "working tree is dirty" 确认会直接把构建卡死。
+      EXPO_NO_GIT_STATUS: '1'
+      CI: '1'
 
     steps:
       - name: 拉代码
         uses: actions/checkout@v4
+
+      - name: 查工具链版本（失败时先看这里）
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          node -v
+          ruby -v
+          pod --version
 
       - name: 装 Node
         uses: actions/setup-node@v4
@@ -43,7 +59,10 @@ jobs:
           npx tsc --noEmit
 
       - name: 生成原生 iOS 工程（expo prebuild）
-        run: npx expo prebuild --platform ios
+        run: |
+          npx expo prebuild --platform ios
+          ls -1 ios
+          ls -1 ios/*.xcworkspace
 
       - name: 编译（关闭签名）
         run: |
@@ -55,12 +74,13 @@ jobs:
             -scheme DSH \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            | tail -n 60
+            | tail -n 80
 
       - name: 打成一个未签名的 ipa
         run: |

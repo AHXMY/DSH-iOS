@@ -39,3 +39,10 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# 改文件前的本机快照（不进仓库）
+backups/
+
+# 本机临时产物
+*.log
+qr-exp.png
