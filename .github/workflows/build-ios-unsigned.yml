@@ -22,8 +22,11 @@ on:
 jobs:
   build:
     # 用 macOS 机器是硬要求：只有它能跑 xcodebuild。
-    # macos-15 带 Xcode 16.x —— RN 0.86 / Expo SDK 57 要求 Xcode 16 以上，
-    # macos-14 默认只有 15.x，会直接在编译期报 SDK 版本不足。
+    # macos-15 镜像里同时装了 Xcode 16.4（默认）和 26.x —— 我们要的是 26，
+    # 所以下一步会显式 xcode-select 切过去。为什么不能只用默认的 16.4：
+    #   expo-modules-jsi/apple/Package.swift 是 `swift-tools-version: 6.2`，
+    #   Swift 6.2 只有 Xcode 26 才有；16.4（Swift 6.1）会在
+    #   PhaseScriptExecution "Build ExpoModulesJSI xcframework" 直接失败。
     runs-on: macos-15
     timeout-minutes: 60
 
@@ -37,10 +40,27 @@ jobs:
       - name: 拉代码
         uses: actions/checkout@v4
 
-      - name: 查工具链版本（失败时先看这里）
+      - name: 选 Xcode 26（必须）+ 打印工具链版本
         run: |
+          # 为什么必须换 Xcode：
+          #   expo-modules-jsi 的 apple/Package.swift 头一行是
+          #   `swift-tools-version: 6.2`，而 Swift 6.2 只在 Xcode 26 里。
+          #   macos-15 镜像默认是 Xcode 16.4（Swift 6.1），
+          #   → 嵌套 SwiftPM 构建直接报 tools version 不满足
+          #   → 失败在 PhaseScriptExecution "Build ExpoModulesJSI xcframework"。
+          ls -1 /Applications | grep -i '^Xcode' || true
+          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$XC" ]; then
+            echo "没找到 Xcode 26，镜像里可用的 Xcode 见上面那行"
+            exit 1
+          fi
+          echo "selected Xcode: $XC"
+          sudo xcode-select -s "$XC"
+          # DEVELOPER_DIR 同时导出给后续步骤：build-xcframework.sh 会把它
+          # 转发给嵌套的 xcodebuild，保证内外用同一个工具链。
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           xcodebuild -version
-          xcode-select -p
+          swift --version
           node -v
           ruby -v
           pod --version
@@ -66,21 +86,37 @@ jobs:
 
       - name: 编译（关闭签名）
         run: |
-          set -o pipefail
           cd ios
           # scheme 与应用名一致（app.json 里的 name 是 DSH）
+          # 关键：**不要**把 xcodebuild 的输出直接接 tail —— 真错误在最前面，
+          # 接 tail 只会看到一堆 "Disabling previews" 噪音，等于把病因删掉。
+          # 先全量落盘，失败时再挑错误行打印。
+          set +e
           xcodebuild \
             -workspace DSH.xcworkspace \
             -scheme DSH \
             -configuration Release \
             -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
+            -destination "generic/platform=iOS" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            | tail -n 80
+            > /tmp/xcodebuild.log 2>&1
+          CODE=$?
+          set -e
+          echo "xcodebuild exit code: $CODE"
+          if [ "$CODE" -ne 0 ]; then
+            echo "======== 错误行 ========"
+            grep -nE 'error:|fatal error|BUILD FAILED|build commands failed|Undefined symbol|Command .* failed|Reason:|is not a valid|does not exist' /tmp/xcodebuild.log | head -n 120 || true
+            echo "======== 前 80 行 ========"
+            head -n 80 /tmp/xcodebuild.log
+            echo "======== 后 150 行 ========"
+            tail -n 150 /tmp/xcodebuild.log
+            exit "$CODE"
+          fi
+          tail -n 20 /tmp/xcodebuild.log
 
       - name: 打成一个未签名的 ipa
         run: |
