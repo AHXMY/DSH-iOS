@@ -1,0 +1,83 @@
+# 云端编译出**未签名**的 iOS 包（免费 Apple ID 签名的前置步骤）
+#
+# 为什么要有它：Windows 上没有 Xcode，本地编不了 iOS 二进制；
+# 而 Expo 的云构建（EAS）给真机签名需要 $99 开发者账号。
+# 这条路绕开两者：GitHub 的 macOS 机器负责编译，签名的活交给 Windows 上的 Sideloadly
+# （用你的免费 Apple ID，在本机完成签名，不需要开发者账号）。
+#
+# 产物：DSH-unsigned.ipa（未签名），下载后用 Sideloadly 打开 → 接上 iPhone → 签名安装。
+#
+# 注意：免费 Apple ID 签出来的证书 **7 天过期**，到期用 Sideloadly 重新签一次即可
+# （不需要重新编译，同一个 ipa 可以反复签）。
+
+name: build-ios-unsigned
+
+on:
+  # 手动触发（推荐）：仓库页面 Actions → 本工作流 → Run workflow
+  workflow_dispatch:
+  # 也可以推到主分支时自动跑
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    # 用 macOS 机器是硬要求：只有它能跑 xcodebuild
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: 拉代码
+        uses: actions/checkout@v4
+
+      - name: 装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 装依赖
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+
+      - name: 校验（不通过就不编译，省得等半小时）
+        run: |
+          npx tsc --noEmit
+
+      - name: 生成原生 iOS 工程（expo prebuild）
+        run: npx expo prebuild --platform ios
+
+      - name: 编译（关闭签名）
+        run: |
+          set -o pipefail
+          cd ios
+          # scheme 与应用名一致（app.json 里的 name 是 DSH）
+          xcodebuild \
+            -workspace DSH.xcworkspace \
+            -scheme DSH \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            | tail -n 60
+
+      - name: 打成一个未签名的 ipa
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          echo "app: $APP_PATH"
+          rm -rf Payload DSH-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          # ipa 就是一个含 Payload/<app> 的 zip —— 用 zip 而不是 mac 自带的 ditto，
+          # 是为了保证压缩包里没有多余属性，Sideloadly 解析更稳。
+          zip -qry DSH-unsigned.ipa Payload
+          ls -lh DSH-unsigned.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-unsigned-ipa
+          path: DSH-unsigned.ipa
+          retention-days: 14

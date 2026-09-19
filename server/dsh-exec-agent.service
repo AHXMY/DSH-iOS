@@ -1,0 +1,35 @@
+[Unit]
+Description=DSH 远程执行代理（给手机版 DSH 提供 shell / 文件能力）
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 用一个专用用户跑，别用 root：它就是"那台机器上那个用户"的权限。
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/dsh-exec.env
+Environment=DSH_EXEC_ROOT=/srv/dsh-exec
+Environment=DSH_EXEC_PORT=7717
+Environment=DSH_EXEC_HOST=127.0.0.1
+ExecStart=/usr/bin/node /opt/dsh-exec/exec-agent.mjs
+Restart=always
+RestartSec=3
+
+# 最小权限：它需要写工作区，除此之外都别给。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/srv/dsh-exec
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-exec-agent
+
+[Install]
+WantedBy=multi-user.target
