@@ -211,9 +211,18 @@ jobs:
       - name: 打成一个未签名的 ipa
         run: |
           set -euo pipefail
-          echo "用 Xcode $CHOSEN_XCODE 的产物（derivedData: ios/$CHOSEN_DD）"
+          # 注意：变量后面**不能**紧跟全角括号 —— bash 会把全角括号的
+          # 第一个字节当成变量名的一部分，set -u 下直接报 unbound variable。
+          # 用 ${} 包起来，后面也只留 ASCII。
+          echo "Xcode: ${CHOSEN_XCODE} / derivedData: ios/${CHOSEN_DD}"
           APP_PATH=$(find "ios/$CHOSEN_DD/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n 1)
           echo "app: $APP_PATH"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "没找到编译产物 .app —— 下面把实际目录摊开，便于定位："
+            ls -1 "ios/$CHOSEN_DD/Build/Products" 2>/dev/null || true
+            find "ios/$CHOSEN_DD/Build/Products" -maxdepth 4 -name '*.app' 2>/dev/null || true
+            exit 1
+          fi
           rm -rf Payload DSH-unsigned.ipa
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
