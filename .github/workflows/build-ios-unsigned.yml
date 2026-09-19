@@ -22,12 +22,24 @@ on:
 jobs:
   build:
     # 用 macOS 机器是硬要求：只有它能跑 xcodebuild。
-    # macos-15 镜像里同时装了 Xcode 16.4（默认）和 26.x —— 我们要的是 26，
-    # 所以下一步会显式 xcode-select 切过去。为什么不能只用默认的 16.4：
-    #   expo-modules-jsi/apple/Package.swift 是 `swift-tools-version: 6.2`，
-    #   Swift 6.2 只有 Xcode 26 才有；16.4（Swift 6.1）会在
-    #   PhaseScriptExecution "Build ExpoModulesJSI xcframework" 直接失败。
-    runs-on: macos-15
+    #
+    # 为什么是 macos-26 而不是 macos-15：
+    #   Expo SDK 56/57 要求 **Xcode 26.4+**（Swift 6.3）。macos-15 镜像里最高只有
+    #   Xcode 26.3（Swift 6.2.x），而 6.2.x 会把下面这个注解判成**硬错误**：
+    #
+    #     expo-modules-jsi/.../RuntimeScheduler.h:53 / :61
+    #     error: 'RuntimeScheduler' cannot be annotated with either
+    #     SWIFT_RETURNS_RETAINED or SWIFT_RETURNS_UNRETAINED because it is not
+    #     returning a SWIFT_SHARED_REFERENCE type
+    #
+    #   —— 这是 expo-modules-jsi 57.0.5 引入的已知问题：
+    #      https://github.com/expo/expo/issues/49214
+    #      https://github.com/expo/expo/issues/49426
+    #   Swift 6.2.1 / 6.2.3 报错；Swift 6.3 / 6.3.3 只当警告，构建正常通过。
+    #   Expo 官方给的结论就是"升到 Xcode 26.4 或更新"。
+    #
+    #   macos-26 镜像自带 26.6（默认）/ 26.5 / 26.4.1 —— 满足要求。
+    runs-on: macos-26
     timeout-minutes: 60
 
     env:
@@ -40,25 +52,35 @@ jobs:
       - name: 拉代码
         uses: actions/checkout@v4
 
-      - name: 选 Xcode 26（必须）+ 打印工具链版本
+      - name: 选 Xcode（要 ≥26.4）+ 打印工具链版本
         run: |
-          # 为什么必须换 Xcode：
-          #   expo-modules-jsi 的 apple/Package.swift 头一行是
-          #   `swift-tools-version: 6.2`，而 Swift 6.2 只在 Xcode 26 里。
-          #   macos-15 镜像默认是 Xcode 16.4（Swift 6.1），
-          #   → 嵌套 SwiftPM 构建直接报 tools version 不满足
-          #   → 失败在 PhaseScriptExecution "Build ExpoModulesJSI xcframework"。
+          # 挑 Xcode 的规则：版本 ≥ 26.4（Swift ≥ 6.3），新的优先。
+          # 26.3 及以下（Swift 6.2.x）会在 ExpoModulesJSI 那步直接报错，
+          # 详见 jobs.build 顶部注释里的 issue 链接。
           ls -1 /Applications | grep -i '^Xcode' || true
-          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)"
-          if [ -z "$XC" ]; then
-            echo "没找到 Xcode 26，镜像里可用的 Xcode 见上面那行"
+          PICK=""
+          for XC in $(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V -r); do
+            V=$(basename "$XC" .app)
+            V=${V#Xcode_}
+            MAJ=${V%%.*}
+            REST=${V#*.}
+            MIN=${REST%%.*}
+            if [ "$MAJ" -gt 26 ] || { [ "$MAJ" -eq 26 ] && [ "$MIN" -ge 4 ]; }; then
+              PICK="$XC"
+              break
+            fi
+          done
+          if [ -z "$PICK" ]; then
+            echo "镜像里没有 ≥26.4 的 Xcode，可用版本见上一行"
             exit 1
           fi
-          echo "selected Xcode: $XC"
-          sudo xcode-select -s "$XC"
+          echo "selected Xcode: $PICK"
+          sudo xcode-select -s "$PICK"
           # DEVELOPER_DIR 同时导出给后续步骤：build-xcframework.sh 会把它
           # 转发给嵌套的 xcodebuild，保证内外用同一个工具链。
-          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$PICK/Contents/Developer" >> "$GITHUB_ENV"
+          # 记下这个版本号，编译步骤的第一顺位就试它。
+          echo "PREFERRED_XCODE=$(basename "$PICK" .app | sed 's/Xcode_//')" >> "$GITHUB_ENV"
           xcodebuild -version
           swift --version
           node -v
@@ -116,20 +138,28 @@ jobs:
           cd ios
           # scheme 与应用名一致（app.json 里的 name 是 DSH）
           #
-          # 为什么要逐个试 Xcode：
-          #   - 新版 clang（Xcode 26.3）把 expo-modules-jsi 的 RuntimeScheduler.h
-          #     里构造函数的 SWIFT_RETURNS_RETAINED 判成了**错误**：
-          #     "'RuntimeScheduler' cannot be annotated with either SWIFT_RETURNS_RETAINED
-          #      or SWIFT_RETURNS_UNRETAINED because it is not returning a
-          #      SWIFT_SHARED_REFERENCE type"（类尾部才挂 SWIFT_SHARED_REFERENCE，
-          #     新 clang 提前检查 → 判不出来）。
-          #   - 但 Package.swift 又要 swift-tools-version 6.2，只有 Xcode 26.x 有。
-          #   所以只能在 26.x 里挑一个 clang 不那么激进的：26.2 → 26.1.1 → 26.0.1。
-          #   失败一次只要 ~1 分钟，比来回改配置便宜得多。
+          # 候选顺序：先前一步挑出来的那个（PREFERRED_XCODE，≥26.4），
+          # 再按"新→旧"排剩下的 ≥26.4 版本。每个候选用独立的 derivedDataPath，
+          # 失败就换下一个（失败一次约 1 分钟），不用来回改配置。
+          # 为什么必须 ≥26.4，见 jobs.build 顶部的注释（expo/expo#49214、#49426）。
           #
           # 另外：**不要**把输出接 tail —— 真错误在最前面，接 tail 等于删掉病因。
-          CANDIDATES=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V -r)
-          echo "候选 Xcode（新→旧）:"; echo "$CANDIDATES"
+          ALL_XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V -r)
+          CANDIDATES=""
+          if [ -n "${PREFERRED_XCODE:-}" ] && [ -d "/Applications/Xcode_$PREFERRED_XCODE.app" ]; then
+            CANDIDATES="/Applications/Xcode_$PREFERRED_XCODE.app"
+          fi
+          for XC in $ALL_XC; do
+            V=$(basename "$XC" .app); V=${V#Xcode_}
+            MAJ=${V%%.*}; REST=${V#*.}; MIN=${REST%%.*}
+            if [ "$MAJ" -gt 26 ] || { [ "$MAJ" -eq 26 ] && [ "$MIN" -ge 4 ]; }; then
+              case " $CANDIDATES " in
+                *" $XC "*) ;;
+                *) CANDIDATES="$CANDIDATES $XC" ;;
+              esac
+            fi
+          done
+          echo "候选 Xcode（≥26.4）:"; echo "$CANDIDATES"
           ALLFAIL=1
           for XC in $CANDIDATES; do
             VER=$(basename "$XC" .app)
@@ -139,6 +169,7 @@ jobs:
             export DEVELOPER_DIR="$XC/Contents/Developer"
             DD="build-$VER"
             LOG="/tmp/xcodebuild-$VER.log"
+            swift --version
             set +e
             xcodebuild \
               -workspace DSH.xcworkspace \
